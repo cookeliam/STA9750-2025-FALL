@@ -1,0 +1,551 @@
+---
+title: "Mini-Project #03: Visualizing and Maintaining the Green Canopy of NYC"
+author: Liam Cooke
+date: "14 November 2025"
+format: 
+  html:
+    code-fold: true
+    toc: true
+    toc-depth: 3
+    self-contained: true
+editor: visual
+---
+
+## Introduction
+
+![](/nyc-bg.jpg)
+
+In this project, I explored the NYC TreeMap data set, focusing on creating compelling visualizations of this beloved element of NYC’s urban fabric. Based on these visualizations, I proposed a new program for the NYC Parks Department that attempts to make the benefits of NYC trees available to all New Yorkers.
+
+## Data Acquisition
+
+```{r ,echo=FALSE}
+#| output: false
+library(sf)
+library(tidyverse)
+library(httr2)
+library(dplyr)
+library(ggplot2)
+library(DT)
+library(scales)
+
+style_dt <- function(df, caption) {
+  df |>
+    datatable(
+      options = list(dom = 't', paging = FALSE, searching = FALSE),
+      caption = caption
+    )
+}
+```
+
+I first downloaded the NYC city council district boundaries found on the NYC Department of Planning site. I created a function to read this data from a static file and unzip the data before use.
+
+```{r}
+download_nyc_districts <- function() {
+  # Create proper dir if it doesnt exist yet
+  if (!dir.exists(file.path("data", "mp03"))) {
+    dir.create(file.path("data", "mp03"), showWarnings = FALSE, recursive = TRUE)
+  }
+  
+  ZIP_FILENAME <- file.path("data", "mp03", "nycc_districts.zip")
+  URL <- "https://s-media.nyc.gov/agencies/dcp/assets/files/zip/data-tools/bytes/city-council/nycc_25c.zip"
+  
+  # Download ZIP if not already saved locally
+  if (!file.exists(ZIP_FILENAME)) {
+    download.file(URL, destfile = ZIP_FILENAME, mode = "wb", quiet = TRUE)
+  }
+  
+  UNZIP_DIR <- file.path("data", "mp03", "unzipped")
+  SHP_FILE  <- file.path(UNZIP_DIR, "nycc_25c", "nycc.shp")
+  
+  # Unzip only if the shapefile has not been extracted yet
+  if (!file.exists(SHP_FILE)) {
+    if (!dir.exists(UNZIP_DIR)) {
+      dir.create(UNZIP_DIR, showWarnings = FALSE, recursive = TRUE)
+    }
+    unzip(ZIP_FILENAME, exdir = UNZIP_DIR)
+  }
+  
+  # Read the shapefile and transform to WGS84
+  districts <- sf::st_read(SHP_FILE, quiet = TRUE) |>
+    sf::st_transform(crs = "WGS84")
+  
+  return(districts)
+}
+
+# Result saved as 'districts'
+districts <- download_nyc_districts()
+```
+
+Next, I focused on tree points data. I iteratively queried the NYC OpenData API using the \$limit and \$offset parameters. I chose a reasonable limit and incremented the offset by this amount in each loop, allowing me to page through the full dataset without requesting excessive amounts of data at once. Each batch was saved as a separate GeoJSON file in data/mp03/, with a consistent naming scheme, and downloaded only if not already present to avoid unnecessary API requests. I then read each batch using st_read() from the sf package, standardized column types for consistency, and combined all chunks into a single dataset using bind_rows() from dplyr.
+
+```{r}
+download_nyc_trees <- function(max_batches = Inf) {
+  # Create proper dir if it doesnt exist yet
+  if (!dir.exists(file.path("data", "mp03"))) {
+    dir.create(file.path("data", "mp03"), showWarnings = FALSE, recursive = TRUE)
+  }
+  
+  URL <- "https://data.cityofnewyork.us/resource/hn5i-inap.geojson"
+  LIMIT  <- 5000L
+  OFFSET <- 0L
+  TREE_LIST <- list()
+  EOD <- FALSE
+  batch_count <- 0L
+  
+  while (!EOD) {
+    # Stop early if the limit is hit
+    if (batch_count >= max_batches) {
+      break
+    }
+    
+    offset_str <- sprintf("%07d", OFFSET)
+    TREE_FILE  <- file.path("data", "mp03", paste0("nyc_trees_", offset_str, ".geojson"))
+    
+    # Only download if the file is missing
+    if (!file.exists(TREE_FILE)) {
+      request(URL) |>
+        req_url_query(`$limit` = LIMIT, `$offset` = OFFSET) |>
+        req_retry(max_tries = 5) |>
+        req_perform(path = TREE_FILE)
+    }
+    
+    tree_data <- st_read(TREE_FILE, quiet = TRUE)
+    
+    # Stop if no data returned
+    if (nrow(tree_data) == 0L) {
+      EOD <- TRUE
+    } else {
+      if ("planteddate" %in% names(tree_data) && !is.character(tree_data$planteddate)) {
+        tree_data$planteddate <- as.character(tree_data$planteddate)
+      }
+      
+      TREE_LIST <- c(TREE_LIST, list(tree_data))
+      batch_count <- batch_count + 1L
+      
+      if (nrow(tree_data) < LIMIT) {
+        EOD <- TRUE
+      } else {
+        OFFSET <- OFFSET + LIMIT
+      }
+    }
+  }
+  
+  # Combine all pages into one sf object
+  trees <- bind_rows(TREE_LIST)
+  return(trees)
+}
+
+trees <- download_nyc_trees()
+```
+
+## Data Integration and Initial Exploration
+
+### Mapping NYC Trees
+
+(Includes Extra Credit 1) To visualize the distribution of NYC street trees, I created an interactive leaflet map. I plotted the council districts as polygon layers and then added all tree locations as circle markers, but enabled marker clustering so that dense areas aggregate into clickable clusters instead of completely covering the basemap. Below that is an initial ggplot2 visualization of the same data.
+
+```{r}
+library(leaflet)
+library(sf)
+library(dplyr)
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  
+  # Council district polygons
+  addPolygons(
+    data        = districts,
+    color       = "#444444",
+    weight      = 1,
+    fillColor   = "lightgrey",
+    fillOpacity = 0.2,
+    group       = "Council Districts",
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color  = "#000000",
+      bringToFront = TRUE
+    ),
+    label = ~paste("District", districts$CounDist)
+  ) |>
+  
+  # Tree points
+  addCircleMarkers(
+    data        = trees,
+    radius      = 2,
+    stroke      = FALSE,
+    fillColor   = "darkgreen",
+    fillOpacity = 0.8,
+    group       = "Trees",
+    clusterOptions = markerClusterOptions(),
+  ) |>
+  
+  addLayersControl(
+    overlayGroups = c("Council Districts", "Trees"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+
+```
+
+```{r}
+ggplot() +
+  # District boundaries
+  geom_sf(
+    data = districts,
+    fill  = "grey95",
+    color = "grey60",
+    linewidth = 0.3
+  ) +
+  # Tree dots
+  geom_sf(
+    data = trees,
+    size  = 0.05,
+    alpha = 0.03,
+    color = "darkgreen"
+  ) +
+  coord_sf() +
+  theme_minimal() +
+  labs(
+    title    = "NYC Street Trees on City Council Districts",
+    subtitle = paste(scales::comma(nrow(trees)), "trees across New York City"),
+    caption = "Sources: NYC Dept. of City Planning, NYC Open Data",
+    x = NULL,
+    y = NULL
+  ) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### District-Level Analyses of Trees
+
+#### 1. Which council district has the most trees?
+
+The council district with the most trees is district 51 with a total of 70965 trees.
+
+```{r}
+trees_with_districts <- st_join(trees, districts, join = st_intersects)
+
+district_most_trees <- trees_with_districts |>
+  st_drop_geometry() |>
+  group_by(CounDist) |>
+  summarise(tree_count = n(), .groups = "drop") |>
+  slice_max(tree_count, n = 5, with_ties = FALSE) |>
+  transmute(
+    `Council District` = CounDist,
+    `Tree Count` = tree_count
+  )
+
+style_dt(district_most_trees, "Council District With the Most Trees")
+```
+
+#### 2. Which council district has the highest density of trees?
+
+District 7 shows the highest tree density, with 15,648 trees in an area of 55,186,140 square meters.
+
+```{r}
+district_highest_density <- trees_with_districts |>
+  st_drop_geometry() |>
+  group_by(CounDist, Shape_Area) |>
+  summarise(tree_count = n(), .groups = "drop") |>
+  mutate(tree_density = tree_count / Shape_Area) |>
+  slice_max(tree_density, n = 5, with_ties = FALSE) |>
+  transmute(
+    `Council District` = CounDist,
+    `Tree Count` = comma(tree_count),
+    `Area (sq meters)` = comma(round(Shape_Area, 0)),
+    `Tree Density (trees per sq meter)` = signif(tree_density, 3)
+  )
+
+style_dt(district_highest_density, "Council District With the Highest Density of Trees")
+```
+
+#### 3. Which district has highest fraction of dead trees out of all trees?
+
+District 32 has the highest share of dead trees 14.3%, showing a need for focus on this region.
+
+```{r}
+by_dist <- trees_with_districts |>
+  st_drop_geometry() |>
+  group_by(CounDist) |>
+  summarise(
+    total_trees = n(),
+    dead_trees  = sum(tpcondition == "Dead", na.rm = TRUE),
+    dead_frac   = dead_trees / total_trees,
+    .groups = "drop"
+  )
+
+highest_dead_frac_dist <- by_dist |>
+  arrange(desc(dead_frac)) |>
+  slice_head(n = 5) |>
+  transmute(
+    `Council District` = CounDist,
+    `Total Trees`      = comma(total_trees),
+    `Dead Trees`       = comma(dead_trees),
+    `Fraction Dead`    = percent(dead_frac, accuracy = 0.1)
+  )
+
+style_dt(highest_dead_frac_dist, "Council District With the Highest Fraction of Dead Trees")
+```
+
+#### 4. What is the most common tree species in Manhattan?
+
+Gleditsia triacanthos var. inermis - Thornless honeylocust is the most common in Manhattan with 17310 recorded trees.
+
+```{r}
+# Add a Borough Column Using case_when()
+trees_with_borough <- trees_with_districts |>
+  st_drop_geometry() |>
+  mutate(
+    borough = case_when(
+      CounDist >= 1  & CounDist <= 10 ~ "Manhattan",
+      CounDist >= 11 & CounDist <= 18 ~ "Bronx",
+      CounDist >= 19 & CounDist <= 32 ~ "Queens",
+      CounDist >= 33 & CounDist <= 48 ~ "Brooklyn",
+      CounDist >= 49 & CounDist <= 51 ~ "Staten Island",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Filter to Manhattan Trees
+manhattan_trees <- trees_with_borough |>
+  filter(borough == "Manhattan")
+
+# Find the Most Common Species
+most_common_species_manhattan <- manhattan_trees |>
+  count(genusspecies, sort = TRUE) |>
+  slice_head(n = 5) |>
+  transmute(
+    `Species` = genusspecies,
+    `Count` = n
+  )
+
+most_common_species_manhattan |> style_dt("Most Common Tree Species in Manhattan")
+```
+
+#### 5. What is the species of the tree closest to Baruch’s campus?
+
+Liquidambar styraciflua - sweetgum is the species of the tree closest to Baruch’s campus.
+
+```{r}
+new_st_point <- function(lat, lon) {
+  st_sfc(st_point(c(lon, lat)), crs = "WGS84")
+}
+
+baruch_point <- new_st_point(
+  lat = 40.7404,
+  lon = -73.9832
+)
+
+closest_tree <- trees_with_districts |>
+  mutate(distance = st_distance(geometry, baruch_point)) |>
+  slice_min(distance, n = 1) |>
+  st_drop_geometry() |>
+  transmute(
+    `Species (Common Name)` = genusspecies,
+    `Distance to Baruch (m)` = as.numeric(distance)
+  )
+
+style_dt(closest_tree, "Tree Closest to Baruch College")
+
+# Find closest tree to Baruch
+closest_tree <- trees_with_districts |>
+  mutate(distance = st_distance(geometry, baruch_point)) |>
+  slice_min(distance, n = 1)
+
+# Baruch as a simple data frame
+baruch_df <- tibble::tibble(
+  name = "Baruch College",
+  lon  = -73.9832,
+  lat  = 40.7404
+)
+
+# Closest tree with extracted coordinates
+closest_tree_df <- closest_tree |>
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  ) |>
+  st_drop_geometry()
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  
+  # Baruch marker
+  addCircleMarkers(
+    data        = baruch_df,
+    lng         = ~lon,
+    lat         = ~lat,
+    radius      = 6,
+    color       = "blue",
+    stroke      = TRUE,
+    weight      = 2,
+    fillColor   = "lightblue",
+    fillOpacity = 0.8,
+    label       = ~name,
+    popup       = ~name,
+    group       = "Baruch"
+  ) |>
+  
+  # Closest tree marker
+  addCircleMarkers(
+    data        = closest_tree_df,
+    lng         = ~lon,
+    lat         = ~lat,
+    radius      = 6,
+    color       = "darkgreen",
+    stroke      = TRUE,
+    weight      = 2,
+    fillColor   = "lightgreen",
+    fillOpacity = 0.8,
+    label       = ~genusspecies,
+    popup       = ~paste0("Closest Tree<br>Species: ", genusspecies),
+    group       = "Closest Tree"
+  ) |>
+  setView(lng = -73.9832, lat = 40.7404, zoom = 17)
+
+```
+
+## Government Project Design: Revitalizing the Tree Canopy in Council District 2
+
+### Executive Summary
+
+Council District 2 is home to neighborhoods such as Gramercy, Kips Bay, and the East Village. This district contains some of Manhattan’s most intensively used pedestrian corridors, yet it suffers from one of the lowest tree densities in Manhattan. Dense built form, aging trees, and a relatively high share of “Fair” and “Poor” condition trees limit shade coverage, reduce air-quality benefits, and diminish local environmental resilience. I propose a targeted Tree Canopy Revitalization Initiative for District 2 aimed at replacing dead and declining trees while expanding canopy coverage in underserved blocks.
+
+### Proposed Idea
+
+The District 2 Street Tree Renewal & Canopy Equity Initiative seeks to revitalize the district’s urban forest by addressing three key needs: 
+
+1. Replace declining or dead trees that no longer provide shade or stormwater benefits
+2. Plant new, resilient species in under-shaded, high-use corridors
+3. Restore stump sites and vacant pits to expand future canopy coverage
+
+This initiative will focus on major pedestrian and transit corridors including 14th Street, 23rd Street, 2nd Avenue, and Stuyvesant Town’s perimeter blocks. We aim to accomplish at least 40 dead or severely unhealthy tree removals, 85 new tree plantings using resilient, climate-tolerant species, and 20 stump restorations.
+
+### District 2 Tree Overview
+
+```{r}
+# Filter District 2 only
+district_2_trees <- trees_with_districts |> filter(CounDist == 2)
+district_2_shape <- districts |> filter(CounDist == 2)
+
+library(leaflet)
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    data = district_2_shape,
+    color = "black",
+    weight = 2,
+    fillColor = "lightgrey",
+    fillOpacity = 0.2
+  ) |>
+  addCircleMarkers(
+    data = district_2_trees |> 
+      mutate(lon = st_coordinates(geometry)[,1],
+             lat = st_coordinates(geometry)[,2]),
+    lng = ~lon, lat = ~lat,
+    radius = 2,
+    color = "darkgreen",
+    fillOpacity = 0.5
+  ) |>
+  setView(lng = -73.9861, lat = 40.7337, zoom = 14)
+```
+
+### Why District 2?
+
+District 2 is an urgent candidate for a targeted canopy renewal effort.
+
+- District 2 has one of the lowest tree densities in Manhattan, ranking significantly below nearby Districts 3, 5, and 7. 
+- The district has very low tree quality scores compared to neighboring districts. See the map visualization below for reference.
+- District 2 has a higher fraction of dead trees than at least three neighboring districts, indicating accelerated decline. See the bar chart below for a better visualization.
+- District 2 contains high-foot-traffic corridors, senior housing, schools, and medical facilities, where shade and air-quality benefits are especially valuable.
+- With few large parks, street trees carry a disproportionately large share of the district’s environmental burden.
+
+Taken together, these factors make District 2 one of the most canopy-vulnerable districts in Manhattan and a strong candidate for supplemental Parks funding.
+
+### Visualizations
+
+```{r}
+# Filter to the four districts being compared
+compare_dists <- by_dist |>
+  filter(CounDist %in% c(2, 3, 5, 7)) |>
+  mutate(
+    # Convert district numbers into ordered labels
+    District = factor(
+      paste0("District ", CounDist),
+      levels = paste0("District ", c(2, 3, 5, 7))
+    )
+  )
+
+ggplot(compare_dists, aes(x = District, y = dead_frac)) +
+  geom_col(width = 0.7, fill = "firebrick") +
+  
+  # Add percent labels directly above each bar
+  geom_text(
+    aes(label = percent(dead_frac, accuracy = 0.1)),
+    vjust = -0.4,
+    size = 5
+  ) +
+  
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.1))
+  ) +
+  
+  labs(
+    title = "Dead-Tree Fraction in Districts 2, 3, 5, and 7",
+    subtitle = "District 2 shows a higher proportion of dead trees",
+    x = "",
+    y = "Share of Trees Classified as Dead"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.x = element_blank(),  # Remove unnecessary vertical grid lines
+    panel.grid.minor   = element_blank(),
+    axis.text.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+
+```
+
+This bar chart compares the proportion of trees classified as Dead across four Manhattan council districts: 2, 3, 5, and 7. District 2 exhibits a noticeably higher dead-tree fraction than its neighboring districts, indicating accelerated decline in its street-tree canopy. While all districts include some aging trees, District 2’s elevated share of dead trees suggests that its existing canopy is under greater stress and more urgently requires replacement, maintenance, or both.
+
+```{r, message=FALSE, warning=FALSE}
+condition_scores <- trees_with_districts |>
+  st_drop_geometry() |>
+  mutate(score = case_when(
+    tpcondition == "Excellent" ~ 4,
+    tpcondition == "Good"      ~ 3,
+    tpcondition == "Fair"      ~ 2,
+    tpcondition == "Poor"      ~ 1,
+    tpcondition == "Dead"      ~ 0,
+    TRUE ~ NA_real_
+  )) |>
+  group_by(CounDist) |>
+  summarise(mean_condition = mean(score, na.rm=TRUE))
+
+cond_map <- districts |>
+  left_join(condition_scores, by="CounDist") |>
+  filter(CounDist %in% c(2,3,5,7))
+
+ggplot(cond_map) +
+  geom_sf(aes(fill = mean_condition), color="white") +
+  geom_sf_text(aes(label = CounDist)) +
+  scale_fill_viridis_c(option="plasma", name="Avg Tree\nCondition") +
+  labs(
+    title = "Average Tree Condition in Districts 2, 3, 5, and 7",
+    subtitle = "District 2 emerges as a priority if condition scores are lower",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+This map visualizes the average tree-condition score for each district, with color intensity indicating overall canopy health based on NYC Parks condition ratings (“Excellent,” “Good,” “Fair,” “Poor,” and “Dead”). By aggregating these scores geographically, the map reveals that District 2 has a comparatively lower average condition than its peers. In other words, trees in District 2 tend to be older, more stressed, or in poorer health relative to those in neighboring districts.
+
+### Concluding Remarks
+
+This initiative directly supports NYC Parks’ Urban Forest Agenda and City Council priorities for equitable climate adaptation. By replacing declining trees with more resilient species and extending canopy coverage on high-traffic blocks, the project enhances summer cooling, improves stormwater retention, and strengthens quality of life for the more than 160,000 residents of District 2. Acting now allows the city to prevent further canopy decline in one of Manhattan’s most utilized districts while establishing a replicable model for other high-density neighborhoods citywide. Through targeted, data-guided investment, DPR can help ensure that District 2’s streets remain livable, shaded, and resilient for decades to come.
